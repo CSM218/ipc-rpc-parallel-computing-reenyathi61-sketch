@@ -45,6 +45,7 @@ public class Master {
 
     private ScheduledFuture<?> reconcilerFuture;
     private ServerSocket server;
+    private static final int MAX_RETRIES = 5;
 
     private static class Task {
         final int id;
@@ -173,47 +174,60 @@ public class Master {
     private void handleConnection(Socket s) {
         try (Socket sock = s) {
             java.io.InputStream in = sock.getInputStream();
-            // read length-prefixed message
-            byte[] lenBuf = new byte[4];
-            int r = in.read(lenBuf);
-            if (r != 4) return;
-            int total = java.nio.ByteBuffer.wrap(lenBuf).getInt();
-            byte[] body = new byte[total];
-            int received = 0;
-            while (received < total) {
-                int n = in.read(body, received, total - received);
-                if (n < 0) break;
-                received += n;
-            }
-            byte[] framed = new byte[4 + total];
-            System.arraycopy(lenBuf, 0, framed, 0, 4);
-            System.arraycopy(body, 0, framed, 4, total);
+            java.io.OutputStream out = sock.getOutputStream();
 
-            Message m = Message.unpack(framed);
-            if (m == null) return;
+            // Continuously read length-prefixed messages from the socket
+            while (true) {
+                // read exactly 4 bytes for length header
+                byte[] lenBuf = new byte[4];
+                int r = 0;
+                while (r < 4) {
+                    int n = in.read(lenBuf, r, 4 - r);
+                    if (n < 0) return; // stream closed
+                    r += n;
+                }
+                int total = java.nio.ByteBuffer.wrap(lenBuf).getInt();
+                if (total <= 0) return;
 
-            // handle message types: IDENTIFY, HEARTBEAT, RESULT
-            if ("IDENTIFY".equals(m.type)) {
-                String id = m.sender != null ? m.sender : ("worker-" + Instant.now().toEpochMilli());
-                workersLastSeen.put(id, System.currentTimeMillis());
-                workerAlive.put(id, true);
+                byte[] body = new byte[total];
+                int received = 0;
+                while (received < total) {
+                    int n = in.read(body, received, total - received);
+                    if (n < 0) return;
+                    received += n;
+                }
 
-                // send ACK
-                Message ack = new Message();
-                ack.magic = "PDC";
-                ack.version = 1;
-                ack.type = "ACK";
-                ack.sender = "master";
-                ack.timestamp = System.currentTimeMillis();
-                ack.payload = "ok".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-                sock.getOutputStream().write(ack.pack());
-            } else if ("HEARTBEAT".equals(m.type)) {
-                String id = m.sender;
-                if (id != null) workersLastSeen.put(id, System.currentTimeMillis());
-            } else if ("RESULT".equals(m.type)) {
-                // In a real implementation we'd parse the payload and mark task complete
-                // For now, update last-seen and accept result
-                if (m.sender != null) workersLastSeen.put(m.sender, System.currentTimeMillis());
+                byte[] framed = new byte[4 + total];
+                System.arraycopy(lenBuf, 0, framed, 0, 4);
+                System.arraycopy(body, 0, framed, 4, total);
+
+                Message m = Message.unpack(framed);
+                if (m == null) continue;
+
+                // handle message types: IDENTIFY, HEARTBEAT, RESULT
+                if ("IDENTIFY".equals(m.type)) {
+                    String id = m.sender != null ? m.sender : ("worker-" + Instant.now().toEpochMilli());
+                    workersLastSeen.put(id, System.currentTimeMillis());
+                    workerAlive.put(id, true);
+
+                    // send ACK
+                    Message ack = new Message();
+                    ack.magic = "PDC";
+                    ack.version = 1;
+                    ack.type = "ACK";
+                    ack.sender = "master";
+                    ack.timestamp = System.currentTimeMillis();
+                    ack.payload = "ok".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    out.write(ack.pack());
+                    out.flush();
+                } else if ("HEARTBEAT".equals(m.type)) {
+                    String id = m.sender;
+                    if (id != null) workersLastSeen.put(id, System.currentTimeMillis());
+                } else if ("RESULT".equals(m.type)) {
+                    // In a real implementation we'd parse the payload and mark task complete
+                    // For now, update last-seen and accept result
+                    if (m.sender != null) workersLastSeen.put(m.sender, System.currentTimeMillis());
+                }
             }
         } catch (IOException ignored) {
         }
@@ -239,7 +253,15 @@ public class Master {
                     if (id.equals(a.getValue())) {
                         Task t = a.getKey();
                         assignment.remove(t);
-                        tasks.add(t); // reassign/retry
+                        // increment retry count and requeue or give up
+                        int cnt = retries.getOrDefault(t, 0) + 1;
+                        retries.put(t, cnt);
+                        if (cnt <= MAX_RETRIES) {
+                            tasks.add(t); // reassign/retry
+                        } else {
+                            // exceeded retries: move to a dead-letter or log for recovery
+                            // For now, we log (no-op) and drop
+                        }
                     }
                 }
             } else {
