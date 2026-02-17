@@ -1,0 +1,5 @@
+[33m2d9c304[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m i commit these changes
+[33m3d26b30[m Implement Master and Worker classes for distributed computation; add Message class for communication protocol; introduce FastGrader for grading automation.
+[33m5a2ff70[m add deadline
+[33m04d53c2[m Setting up GitHub Classroom Feedback
+[33m6e758df[m[33m ([m[1;31morigin/feedback[m[33m)[m GitHub Classroom Feedback
